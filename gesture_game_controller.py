@@ -12,20 +12,24 @@ import pyautogui
 CAMERA_INDEX = 0
 WINDOW_NAME = "Gesture Game Controller"
 CALIBRATION_SECONDS = 2.0
-SMOOTHING_WINDOW = 5
+SMOOTHING_WINDOW = 3  # Increased from 2 for better stability
 POSE_DET_CONF = 0.5
 POSE_TRACK_CONF = 0.5
 
 # Thresholds are normalized because MediaPipe landmarks are normalized.
-LEFT_RIGHT_THRESHOLD = 0.08
+LEFT_RIGHT_THRESHOLD = 0.05  # Lowered from 0.08 for easier left/right detection
 DUCK_THRESHOLD = 0.10
 JUMP_MARGIN = 0.03
 
+# Hand velocity thresholds for jump detection (velocity-based, faster response)
+HAND_RAISE_VELOCITY_THRESHOLD = 0.08  # Upward hand velocity threshold
+HAND_HEIGHT_THRESHOLD = 0.15  # How far above head to confirm jump
+
 # Cooldowns in seconds
 COOLDOWN_LEFT_RIGHT = 0.45
-COOLDOWN_JUMP = 0.65
+COOLDOWN_JUMP = 0.50  # Reduced from 0.65 for faster consecutive jumps
 COOLDOWN_DUCK = 0.65
-GLOBAL_MIN_GAP = 0.20
+GLOBAL_MIN_GAP = 0.15  # Reduced from 0.20 for more responsive controls
 
 # Safety: move mouse to a corner to trigger pyautogui fail-safe.
 pyautogui.FAILSAFE = True
@@ -43,7 +47,60 @@ class Smoother:
         return sum(self.values) / len(self.values)
 
 
+class HandVelocityTracker:
+    """Tracks hand velocity to detect quick raises for jump (lower latency)."""
+    def __init__(self, history_size: int = 3):
+        self.history_size = history_size
+        self.left_hand_history = deque(maxlen=history_size)
+        self.right_hand_history = deque(maxlen=history_size)
+
+    def update(self, left_wrist_y: float, right_wrist_y: float):
+        self.left_hand_history.append(left_wrist_y)
+        self.right_hand_history.append(right_wrist_y)
+
+    def get_velocity(self, is_left: bool = True) -> float:
+        """Returns upward velocity (negative = moving up). No smoothing for instant response."""
+        history = self.left_hand_history if is_left else self.right_hand_history
+        if len(history) < 2:
+            return 0.0
+        # Most recent velocity (current - previous)
+        return history[-2] - history[-1]  # Negative = hand moving up
+
+    def both_hands_rising(self) -> bool:
+        """Check if both hands are moving upward."""
+        left_vel = self.get_velocity(True)
+        right_vel = self.get_velocity(False)
+        return left_vel >= HAND_RAISE_VELOCITY_THRESHOLD and right_vel >= HAND_RAISE_VELOCITY_THRESHOLD
+
+
 class CalibrationState:
+    def __init__(self):
+        self.nose_x_values = []
+        self.nose_y_values = []
+        self.start_time = None
+        self.center_nose_x = None
+        self.center_nose_y = None
+        self.done = False
+
+    def start(self):
+        self.start_time = time.time()
+
+    def update(self, nose_x: float, nose_y: float):
+        self.nose_x_values.append(nose_x)
+        self.nose_y_values.append(nose_y)
+
+    def elapsed(self) -> float:
+        if self.start_time is None:
+            return 0.0
+        return time.time() - self.start_time
+
+    def finalize(self):
+        if not self.nose_x_values or not self.nose_y_values:
+            return False
+        self.center_nose_x = sum(self.nose_x_values) / len(self.nose_x_values)
+        self.center_nose_y = sum(self.nose_y_values) / len(self.nose_y_values)
+        self.done = True
+        return True
     def __init__(self):
         self.nose_x_values = []
         self.nose_y_values = []
@@ -135,7 +192,7 @@ class ActionController:
 # -----------------------------
 def get_landmark_xy(landmarks, idx: int):
     lm = landmarks[idx]
-    return lm.x, lm.y
+    return lm.x, lm.y, lm.z
 
 
 def draw_text_block(frame, lines, x=20, y=30, line_gap=28, color=(0, 255, 0)):
@@ -152,23 +209,36 @@ def draw_text_block(frame, lines, x=20, y=30, line_gap=28, color=(0, 255, 0)):
         )
 
 
-def detect_action(landmarks, baseline_x: float, baseline_y: float):
+def detect_action(landmarks, baseline_x: float, baseline_y: float, hand_velocity_tracker=None):
     mp_pose = mp.solutions.pose
 
-    nose_x, nose_y = get_landmark_xy(landmarks, mp_pose.PoseLandmark.NOSE.value)
-    left_wrist_x, left_wrist_y = get_landmark_xy(landmarks, mp_pose.PoseLandmark.LEFT_WRIST.value)
-    right_wrist_x, right_wrist_y = get_landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_WRIST.value)
-    left_shoulder_x, left_shoulder_y = get_landmark_xy(landmarks, mp_pose.PoseLandmark.LEFT_SHOULDER.value)
-    right_shoulder_x, right_shoulder_y = get_landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER.value)
+    nose_x, nose_y, nose_z = get_landmark_xy(landmarks, mp_pose.PoseLandmark.NOSE.value)
+    left_wrist_x, left_wrist_y, left_wrist_z = get_landmark_xy(landmarks, mp_pose.PoseLandmark.LEFT_WRIST.value)
+    right_wrist_x, right_wrist_y, right_wrist_z = get_landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_WRIST.value)
+    left_shoulder_x, left_shoulder_y, left_shoulder_z = get_landmark_xy(landmarks, mp_pose.PoseLandmark.LEFT_SHOULDER.value)
+    right_shoulder_x, right_shoulder_y, right_shoulder_z = get_landmark_xy(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER.value)
 
     # Derived signals
     nose_dx = nose_x - baseline_x
     nose_dy = nose_y - baseline_y
     head_level = min(left_shoulder_y, right_shoulder_y) - JUMP_MARGIN
+    shoulder_line = min(left_shoulder_y, right_shoulder_y)
 
     # Priority matters. Jump/duck first to reduce accidental lane switches.
-    both_wrists_above_head = left_wrist_y < head_level and right_wrist_y < head_level
-    if both_wrists_above_head:
+    # IMPROVED JUMP DETECTION: Use both position AND velocity for lower latency
+    both_wrists_above_head = (
+        left_wrist_y < (head_level - HAND_HEIGHT_THRESHOLD)
+        and right_wrist_y < (head_level - HAND_HEIGHT_THRESHOLD)
+    )
+
+    if hand_velocity_tracker:
+        hand_velocity_tracker.update(left_wrist_y, right_wrist_y)
+        hands_rising_fast = hand_velocity_tracker.both_hands_rising()
+    else:
+        hands_rising_fast = False
+
+    # Trigger jump if: hands are high OR hands are rising quickly (velocity-based for lower latency)
+    if both_wrists_above_head or hands_rising_fast:
         return "JUMP", nose_x, nose_y, nose_dx, nose_dy
 
     crouched = nose_dy > DUCK_THRESHOLD
@@ -204,6 +274,7 @@ def main():
 
     x_smoother = Smoother(maxlen=SMOOTHING_WINDOW)
     y_smoother = Smoother(maxlen=SMOOTHING_WINDOW)
+    hand_velocity_tracker = HandVelocityTracker(history_size=3)  # NEW: For fast jump detection
     calibration = CalibrationState()
     calibration.start()
     controller = ActionController()
@@ -240,7 +311,7 @@ def main():
                 connection_drawing_spec=mp_drawing.DrawingSpec(thickness=2),
             )
 
-            nose_x_raw, nose_y_raw = get_landmark_xy(landmarks, mp_pose.PoseLandmark.NOSE.value)
+            nose_x_raw, nose_y_raw, _ = get_landmark_xy(landmarks, mp_pose.PoseLandmark.NOSE.value)
             nose_x = x_smoother.update(nose_x_raw)
             nose_y = y_smoother.update(nose_y_raw)
 
@@ -272,6 +343,7 @@ def main():
                     landmarks,
                     calibration.center_nose_x,
                     calibration.center_nose_y,
+                    hand_velocity_tracker,
                 )
 
                 # Override overlay text even if cooldown blocks actual press so user sees intent.
@@ -305,7 +377,7 @@ def main():
 
         status_lines = [
             f"Action: {controller.get_overlay_action() if calibration.done else 'WAIT'}",
-            f"dx: {nose_dx:+.3f}   dy: {nose_dy:+.3f}",
+            f"dx: {nose_dx:+.3f}   dy: {nose_dy:+.3f}   thresh: {LEFT_RIGHT_THRESHOLD:.2f}",
             "Lean left/right | Both hands up = jump | Crouch = duck",
             "Press q to quit",
         ]
@@ -320,6 +392,7 @@ def main():
             calibration.start()
             x_smoother = Smoother(maxlen=SMOOTHING_WINDOW)
             y_smoother = Smoother(maxlen=SMOOTHING_WINDOW)
+            hand_velocity_tracker = HandVelocityTracker(history_size=3)  # Reset velocity tracker
             print("Recalibrating...")
 
     cap.release()
